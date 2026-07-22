@@ -9,20 +9,64 @@ import threading
 import time
 import tkinter as tk
 import urllib.request
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 import winsound
-from futu import AuType, KLType, OpenQuoteContext, RET_OK, SubType
+from futu import AuType, KLType, OpenQuoteContext, RET_ERROR, RET_OK, StockQuoteHandlerBase, SubType
 
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "stock_watch_config.json"
 LOG_PATH = APP_DIR / "stock_watch_app.log"
-QUOTE_COLUMNS = ("code", "name", "price", "dividend_yield", "rsi", "kdj", "boll", "ma", "update", "status")
-DEFAULT_DISPLAY_COLUMNS = ["code", "name", "price", "dividend_yield", "rsi", "kdj", "boll", "ma", "update", "status"]
+ALERT_COOLDOWN_SECONDS = 60 * 60
+SNAPSHOT_BATCH_SIZE = 400
+SNAPSHOT_RATE_LIMIT = 55
+SNAPSHOT_RATE_WINDOW_SECONDS = 30.0
+SNAPSHOT_CACHE_TTL_SECONDS = 20.0
+QUOTE_SUBSCRIBE_BATCH_SIZE = 400
+KLINE_CACHE_TTL_SECONDS = 5 * 60.0
+KLINE_REFRESH_PER_TICK = 3
+DIVIDEND_RATE_LIMIT = 20
+DIVIDEND_RATE_WINDOW_SECONDS = 30.0
+QUOTE_COLUMNS = (
+    "code",
+    "name",
+    "price",
+    "change_pct",
+    "turnover",
+    "volume_ratio",
+    "intraday_pos",
+    "dividend_yield",
+    "rsi",
+    "kdj",
+    "boll",
+    "ma",
+    "ma_dev",
+    "atr_pct",
+    "breakout",
+    "update",
+    "status",
+)
+DEFAULT_DISPLAY_COLUMNS = [
+    "code",
+    "name",
+    "price",
+    "change_pct",
+    "turnover",
+    "volume_ratio",
+    "intraday_pos",
+    "dividend_yield",
+    "rsi",
+    "boll",
+    "ma_dev",
+    "atr_pct",
+    "breakout",
+    "status",
+]
 
 
 def write_log(message: str) -> None:
@@ -97,22 +141,50 @@ def moving_average(closes: list[float], period: int) -> float:
     return sum(closes[-period:]) / period
 
 
+def atr_percent(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> float:
+    if len(closes) < period + 1 or len(highs) != len(closes) or len(lows) != len(closes):
+        return math.nan
+    true_ranges = []
+    start = len(closes) - period
+    for index in range(start, len(closes)):
+        prev_close = closes[index - 1]
+        true_ranges.append(
+            max(
+                highs[index] - lows[index],
+                abs(highs[index] - prev_close),
+                abs(lows[index] - prev_close),
+            )
+        )
+    price = closes[-1]
+    if price == 0:
+        return math.nan
+    return sum(true_ranges) / period / price * 100
+
+
+def breakout_text(highs: list[float], lows: list[float], price: float, period: int = 20) -> str:
+    if len(highs) <= period or len(lows) <= period:
+        return ""
+    prev_high = max(highs[-period - 1 : -1])
+    prev_low = min(lows[-period - 1 : -1])
+    if price >= prev_high:
+        return f"{period}日新高"
+    if price <= prev_low:
+        return f"{period}日新低"
+    return ""
+
+
 def migrate_display_columns(columns: list[str]) -> list[str]:
     known = set(QUOTE_COLUMNS)
     migrated = []
-    inserted_dividend_yield = False
     for col in columns:
         if col not in known or col in migrated:
             continue
         migrated.append(col)
-        if col == "price" and "dividend_yield" not in columns:
-            migrated.append("dividend_yield")
-            inserted_dividend_yield = True
     if not migrated:
         return list(DEFAULT_DISPLAY_COLUMNS)
-    if not inserted_dividend_yield and "dividend_yield" not in migrated:
-        insert_at = migrated.index("price") + 1 if "price" in migrated else len(migrated)
-        migrated.insert(insert_at, "dividend_yield")
+    for col in DEFAULT_DISPLAY_COLUMNS:
+        if col in known and col not in migrated:
+            migrated.append(col)
     return migrated
 
 
@@ -355,6 +427,124 @@ class AlertManager:
             stop_sound.wait(1)
 
 
+class RollingRateLimiter:
+    def __init__(self, max_calls: int, window_seconds: float):
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self.calls: deque[float] = deque()
+        self.lock = threading.Lock()
+
+    def wait(self, stop_event: threading.Event) -> bool:
+        while not stop_event.is_set():
+            with self.lock:
+                now = time.time()
+                while self.calls and now - self.calls[0] >= self.window_seconds:
+                    self.calls.popleft()
+                if len(self.calls) < self.max_calls:
+                    self.calls.append(now)
+                    return True
+                sleep_for = max(0.05, self.window_seconds - (now - self.calls[0]) + 0.05)
+            if stop_event.wait(min(sleep_for, 1.0)):
+                return False
+        return False
+
+    def available(self) -> int:
+        with self.lock:
+            now = time.time()
+            while self.calls and now - self.calls[0] >= self.window_seconds:
+                self.calls.popleft()
+            return max(0, self.max_calls - len(self.calls))
+
+
+class MarketDataCache:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.snapshots: dict[str, tuple[float, dict]] = {}
+        self.quotes: dict[str, tuple[float, dict]] = {}
+        self.klines: dict[str, tuple[float, list[float], list[float], list[float]]] = {}
+
+    def update_snapshot_rows(self, data) -> None:
+        now = time.time()
+        rows = self._records(data)
+        with self.lock:
+            for row in rows:
+                code = str(row.get("code", "")).strip()
+                if code:
+                    self.snapshots[code] = (now, row)
+
+    def update_quote_rows(self, data) -> None:
+        now = time.time()
+        rows = self._records(data)
+        with self.lock:
+            for row in rows:
+                code = str(row.get("code", "")).strip()
+                if code:
+                    self.quotes[code] = (now, row)
+
+    def update_kline(self, code: str, closes: list[float], highs: list[float], lows: list[float]) -> None:
+        with self.lock:
+            self.klines[code] = (time.time(), closes, highs, lows)
+
+    def get_market_row(self, code: str) -> tuple[dict | None, float | None]:
+        with self.lock:
+            snapshot_item = self.snapshots.get(code)
+            quote_item = self.quotes.get(code)
+            if not snapshot_item and not quote_item:
+                return None, None
+            row = dict(snapshot_item[1]) if snapshot_item else {}
+            row_time = snapshot_item[0] if snapshot_item else None
+            if quote_item:
+                row.update(quote_item[1])
+                row_time = max(row_time or 0, quote_item[0])
+            return row, row_time
+
+    def get_kline(self, code: str) -> tuple[float, list[float], list[float], list[float]] | None:
+        with self.lock:
+            item = self.klines.get(code)
+            if not item:
+                return None
+            ts, closes, highs, lows = item
+            return ts, list(closes), list(highs), list(lows)
+
+    def snapshot_age(self, code: str) -> float | None:
+        with self.lock:
+            item = self.snapshots.get(code)
+            return None if not item else time.time() - item[0]
+
+    def kline_age(self, code: str) -> float | None:
+        with self.lock:
+            item = self.klines.get(code)
+            return None if not item else time.time() - item[0]
+
+    def _records(self, data) -> list[dict]:
+        if data is None:
+            return []
+        if hasattr(data, "to_dict"):
+            try:
+                return list(data.to_dict("records"))
+            except Exception:
+                pass
+        if isinstance(data, list):
+            return [dict(row) for row in data if hasattr(row, "items")]
+        if hasattr(data, "items"):
+            return [dict(data)]
+        return []
+
+
+class CachedQuoteHandler(StockQuoteHandlerBase):
+    def __init__(self, cache: MarketDataCache):
+        super().__init__()
+        self.cache = cache
+
+    def on_recv_rsp(self, rsp_pb):
+        ret_code, data = super().on_recv_rsp(rsp_pb)
+        if ret_code != RET_OK:
+            write_log(f"ERROR quote push {data}")
+            return RET_ERROR, data
+        self.cache.update_quote_rows(data)
+        return RET_OK, data
+
+
 class MonitorThread(threading.Thread):
     def __init__(self, app_queue: queue.Queue, alert_manager: AlertManager):
         super().__init__(daemon=True)
@@ -365,10 +555,20 @@ class MonitorThread(threading.Thread):
         self.config = load_config()
         self.triggered: set[str] = set()
         self.active_signal_keys: dict[str, str] = {}
+        self.last_alert_at: dict[str, float] = {}
         self.subscribed: set[str] = set()
+        self.kline_subscribed: set[str] = set()
+        self.subscribe_retry_at: dict[str, float] = {}
         self.last_poll_at: dict[str, float] = {}
         self.dividend_cache: dict[str, tuple[float, float]] = {}
         self.dividend_pending: set[str] = set()
+        self.dividend_queue: deque[str] = deque()
+        self.dividend_lock = threading.Lock()
+        self.dividend_limiter = RollingRateLimiter(DIVIDEND_RATE_LIMIT, DIVIDEND_RATE_WINDOW_SECONDS)
+        self.dividend_worker: threading.Thread | None = None
+        self.cache = MarketDataCache()
+        self.snapshot_limiter = RollingRateLimiter(SNAPSHOT_RATE_LIMIT, SNAPSHOT_RATE_WINDOW_SECONDS)
+        self.last_emit_at: dict[str, float] = {}
 
     def update_config(self, config: AppConfig) -> None:
         with self.config_lock:
@@ -382,20 +582,18 @@ class MonitorThread(threading.Thread):
         ctx = None
         try:
             ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+            ctx.set_handler(CachedQuoteHandler(self.cache))
+            self._ensure_dividend_worker()
             self.app_queue.put(("status", "已连接 Futu OpenD"))
             while not self.stop_event.is_set():
                 with self.config_lock:
                     config = config_from_dict(json.loads(json.dumps(asdict(self.config), ensure_ascii=False)))
-                now = time.time()
-                for item in config.items:
-                    if self.stop_event.is_set():
-                        break
-                    if item.enabled and item.code:
-                        code = normalize_code(item.code)
-                        interval = max(1, int(item.refresh_seconds or config.interval_seconds))
-                        if now - self.last_poll_at.get(code, 0) >= interval:
-                            self._poll_item(ctx, item)
-                            self.last_poll_at[code] = now
+                items = [item for item in config.items if item.enabled and item.code]
+                codes = [normalize_code(item.code) for item in items]
+                self._ensure_subscribed(ctx, codes)
+                self._refresh_due_snapshots(ctx, items, config)
+                self._refresh_due_klines(ctx, items)
+                self._emit_due_items(items, config)
                 self.stop_event.wait(1)
         except Exception as exc:
             write_log(f"ERROR monitor stopped: {exc}")
@@ -404,41 +602,134 @@ class MonitorThread(threading.Thread):
             if ctx:
                 ctx.close()
 
-    def _ensure_subscribed(self, ctx: OpenQuoteContext, code: str) -> None:
-        if code in self.subscribed:
-            return
-        ret, data = ctx.subscribe([code], [SubType.K_DAY], subscribe_push=False)
-        if ret != RET_OK:
-            raise RuntimeError(str(data))
-        self.subscribed.add(code)
+    def _ensure_subscribed(self, ctx: OpenQuoteContext, codes: list[str]) -> None:
+        now = time.time()
+        missing = [
+            code
+            for code in dict.fromkeys(codes)
+            if code not in self.subscribed and now >= self.subscribe_retry_at.get(code, 0)
+        ]
+        for batch in self._chunks(missing, QUOTE_SUBSCRIBE_BATCH_SIZE):
+            ret, data = ctx.subscribe(batch, [SubType.QUOTE], is_first_push=True, subscribe_push=True)
+            if ret != RET_OK:
+                write_log(f"ERROR subscribe {batch[:3]}... {data}")
+                retry_at = time.time() + 60
+                for code in batch:
+                    self.subscribe_retry_at[code] = retry_at
+                continue
+            self.subscribed.update(batch)
 
-    def _poll_item(self, ctx: OpenQuoteContext, item: WatchItem) -> None:
+    def _refresh_due_snapshots(self, ctx: OpenQuoteContext, items: list[WatchItem], config: AppConfig) -> None:
+        now = time.time()
+        due_codes: list[str] = []
+        seen = set()
+        for item in items:
+            code = normalize_code(item.code)
+            if code in seen:
+                continue
+            seen.add(code)
+            interval = max(SNAPSHOT_CACHE_TTL_SECONDS, float(item.refresh_seconds or config.interval_seconds))
+            last = self.last_poll_at.get(code, 0)
+            if now - last >= interval or self.cache.snapshot_age(code) is None:
+                due_codes.append(code)
+
+        for batch in self._chunks(due_codes, SNAPSHOT_BATCH_SIZE):
+            if not self.snapshot_limiter.wait(self.stop_event):
+                return
+            ret, snap = ctx.get_market_snapshot(batch)
+            if ret != RET_OK:
+                message = str(snap)
+                write_log(f"ERROR batch snapshot size={len(batch)} {message}")
+                self.app_queue.put(("status", f"批量快照失败：{message}；剩余额度 {self.snapshot_limiter.available()}/{SNAPSHOT_RATE_LIMIT}"))
+                continue
+            self.cache.update_snapshot_rows(snap)
+            poll_time = time.time()
+            for code in batch:
+                self.last_poll_at[code] = poll_time
+            self.app_queue.put(("status", f"批量快照 {len(batch)} 只；剩余额度 {self.snapshot_limiter.available()}/{SNAPSHOT_RATE_LIMIT}"))
+
+    def _refresh_due_klines(self, ctx: OpenQuoteContext, items: list[WatchItem]) -> None:
+        refreshed = 0
+        seen = set()
+        for item in items:
+            if refreshed >= KLINE_REFRESH_PER_TICK or self.stop_event.is_set():
+                return
+            code = normalize_code(item.code)
+            if code in seen:
+                continue
+            seen.add(code)
+            age = self.cache.kline_age(code)
+            if age is not None and age < KLINE_CACHE_TTL_SECONDS:
+                continue
+            try:
+                if code not in self.kline_subscribed:
+                    ret, data = ctx.subscribe([code], [SubType.K_DAY], subscribe_push=False)
+                    if ret != RET_OK:
+                        raise RuntimeError(str(data))
+                    self.kline_subscribed.add(code)
+                ret, kline = ctx.get_cur_kline(code, 300, KLType.K_DAY, autype=AuType.QFQ)
+                if ret != RET_OK:
+                    raise RuntimeError(str(kline))
+                closes = [float(x) for x in kline["close"].tolist()]
+                highs = [float(x) for x in kline["high"].tolist()]
+                lows = [float(x) for x in kline["low"].tolist()]
+                self.cache.update_kline(code, closes, highs, lows)
+                refreshed += 1
+            except Exception as exc:
+                write_log(f"ERROR kline {code} {exc}")
+
+    def _emit_due_items(self, items: list[WatchItem], config: AppConfig) -> None:
+        now = time.time()
+        for item in items:
+            if self.stop_event.is_set():
+                return
+            code = normalize_code(item.code)
+            interval = max(1, int(item.refresh_seconds or config.interval_seconds))
+            if now - self.last_emit_at.get(code, 0) < interval:
+                continue
+            self._poll_item(item)
+            self.last_emit_at[code] = now
+
+    def _poll_item(self, item: WatchItem) -> None:
         try:
             code = normalize_code(item.code)
-            self._ensure_subscribed(ctx, code)
-            ret, snap = ctx.get_market_snapshot([code])
-            if ret != RET_OK:
-                raise RuntimeError(str(snap))
-            row = snap.iloc[0]
+            row, _row_time = self.cache.get_market_row(code)
+            if not row:
+                return
             price = float(row["last_price"])
             price_decimals = self._price_decimals(row)
             name = str(row.get("name", item.name or code))
             update_time = str(row.get("update_time", ""))
-            ret, kline = ctx.get_cur_kline(code, 300, KLType.K_DAY, autype=AuType.QFQ)
-            if ret != RET_OK:
-                raise RuntimeError(str(kline))
-
-            raw_closes = [float(x) for x in kline["close"].tolist()]
-            closes = list(raw_closes)
-            highs = [float(x) for x in kline["high"].tolist()]
-            lows = [float(x) for x in kline["low"].tolist()]
-            if closes:
-                closes[-1] = price
-                highs[-1] = max(highs[-1], price)
-                lows[-1] = min(lows[-1], price)
+            kline_item = self.cache.get_kline(code)
+            if kline_item:
+                _kline_time, raw_closes, highs, lows = kline_item
+                closes = list(raw_closes)
+                if closes:
+                    closes[-1] = price
+                    highs[-1] = max(highs[-1], price)
+                    lows[-1] = min(lows[-1], price)
+            else:
+                raw_closes, closes, highs, lows = [], [], [], []
 
             settings = item.settings
             values: dict[str, float] = {"price": price, "price_decimals": price_decimals}
+            prev_close_price = self._safe_float(row.get("prev_close_price"))
+            if prev_close_price is not None and prev_close_price > 0:
+                values["change_val"] = price - prev_close_price
+                values["change_pct"] = (price - prev_close_price) / prev_close_price * 100
+            turnover = self._safe_float(row.get("turnover"))
+            if turnover is not None:
+                values["turnover"] = turnover
+            turnover_rate = self._safe_float(row.get("turnover_rate"))
+            if turnover_rate is not None:
+                values["turnover_rate"] = turnover_rate
+            volume_ratio = self._safe_float(row.get("volume_ratio"))
+            if volume_ratio is not None:
+                values["volume_ratio"] = volume_ratio
+            high_price = self._safe_float(row.get("high_price"))
+            low_price = self._safe_float(row.get("low_price"))
+            if high_price is not None and low_price is not None and high_price > low_price:
+                values["intraday_pos"] = (price - low_price) / (high_price - low_price) * 100
             if settings.rsi_enabled:
                 values["rsi"] = rsi_cn(closes, settings.rsi_period)
             if settings.kdj_enabled:
@@ -458,6 +749,20 @@ class MonitorThread(threading.Thread):
                     values[f"ma_{period}_prev"] = moving_average(prev_closes, period)
                 if len(raw_closes) >= 2:
                     values["prev_close"] = raw_closes[-2]
+            ma250 = moving_average(closes, 250)
+            if not math.isnan(ma250) and ma250 != 0:
+                values["ma250"] = ma250
+                values["ma250_dev"] = (price - ma250) / ma250 * 100
+            for period in (20, 60, 250):
+                ma_value = moving_average(closes, period)
+                if not math.isnan(ma_value) and ma_value != 0:
+                    values[f"ma{period}_dev"] = (price - ma_value) / ma_value * 100
+            atr_value = atr_percent(highs, lows, closes, 14)
+            if not math.isnan(atr_value):
+                values["atr_pct"] = atr_value
+            breakout = breakout_text(highs, lows, price, 20)
+            if breakout:
+                values["breakout"] = breakout
             snapshot_dividend_yield = self._snapshot_dividend_yield(row, price)
             if snapshot_dividend_yield is not None:
                 values["dividend_yield"] = snapshot_dividend_yield
@@ -473,6 +778,10 @@ class MonitorThread(threading.Thread):
         except Exception as exc:
             self.app_queue.put(("quote_error", normalize_code(item.code), str(exc)))
             write_log(f"ERROR {item.code} {exc}")
+
+    def _chunks(self, values: list[str], size: int):
+        for index in range(0, len(values), size):
+            yield values[index : index + size]
 
     def _snapshot_dividend_yield(self, row, price: float) -> float | None:
         for key in ("dividend_ratio_ttm", "dividend_lfy_ratio", "trust_dividend_yield"):
@@ -493,20 +802,54 @@ class MonitorThread(threading.Thread):
         except Exception:
             return None
 
+    def _safe_float(self, value) -> float | None:
+        try:
+            numeric = float(value)
+            if math.isnan(numeric):
+                return None
+            return numeric
+        except Exception:
+            return None
+
     def _annual_dividend_per_unit(self, code: str) -> float | None:
         cached = self.dividend_cache.get(code)
         now = time.time()
         if cached and now - cached[0] < 6 * 60 * 60:
             return cached[1] or None
-        if code not in self.dividend_pending:
-            self.dividend_pending.add(code)
-            threading.Thread(target=self._refresh_dividend_cache, args=(code,), daemon=True).start()
+        with self.dividend_lock:
+            if code not in self.dividend_pending:
+                self.dividend_pending.add(code)
+                self.dividend_queue.append(code)
         return cached[1] if cached and cached[1] else None
 
-    def _refresh_dividend_cache(self, code: str) -> None:
+    def _ensure_dividend_worker(self) -> None:
+        if self.dividend_worker and self.dividend_worker.is_alive():
+            return
+        self.dividend_worker = threading.Thread(target=self._dividend_worker_loop, daemon=True)
+        self.dividend_worker.start()
+
+    def _dividend_worker_loop(self) -> None:
         ctx = None
         try:
             ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+            while not self.stop_event.is_set():
+                code = None
+                with self.dividend_lock:
+                    if self.dividend_queue:
+                        code = self.dividend_queue.popleft()
+                if not code:
+                    self.stop_event.wait(1)
+                    continue
+                if self.dividend_limiter.wait(self.stop_event):
+                    self._refresh_dividend_cache(ctx, code)
+        except Exception as exc:
+            write_log(f"ERROR dividend worker {exc}")
+        finally:
+            if ctx:
+                ctx.close()
+
+    def _refresh_dividend_cache(self, ctx: OpenQuoteContext, code: str) -> None:
+        try:
             ret, data = ctx.get_corporate_actions_dividends(code)
             if ret != RET_OK:
                 raise RuntimeError(str(data))
@@ -519,9 +862,8 @@ class MonitorThread(threading.Thread):
             self.dividend_cache[code] = (time.time(), 0.0)
             write_log(f"ERROR dividend {code} {exc}")
         finally:
-            if ctx:
-                ctx.close()
-            self.dividend_pending.discard(code)
+            with self.dividend_lock:
+                self.dividend_pending.discard(code)
 
     def _sum_recent_dividends(self, dividend_list: list[dict]) -> float | None:
         cutoff = datetime.now() - timedelta(days=365)
@@ -642,7 +984,9 @@ class MonitorThread(threading.Thread):
                 self.active_signal_keys.pop(state_key, None)
                 continue
             signature = ",".join(sorted(key for key, _message in hits))
-            if self.active_signal_keys.get(state_key) == signature:
+            cooldown_key = f"{state_key}:{signature}"
+            if not self._alert_cooldown_ready(cooldown_key):
+                self.active_signal_keys[state_key] = signature
                 continue
             self.active_signal_keys[state_key] = signature
             level = self._signal_level(side, len(hits))
@@ -660,12 +1004,13 @@ class MonitorThread(threading.Thread):
                     update_time,
                 )
             )
+            self._mark_alert_sent(cooldown_key)
 
         for key, (hit, message, side) in checks.items():
             if side in {"买入", "卖出"}:
                 continue
             trigger_key = f"{code}:{key}"
-            if hit and trigger_key not in self.triggered:
+            if hit and self._alert_cooldown_ready(trigger_key):
                 self.alert_manager.trigger(message + f"\n更新时间：{update_time}")
                 self.app_queue.put(
                     (
@@ -679,8 +1024,16 @@ class MonitorThread(threading.Thread):
                     )
                 )
                 self.triggered.add(trigger_key)
+                self._mark_alert_sent(trigger_key)
             elif not hit and trigger_key in self.triggered:
                 self.triggered.remove(trigger_key)
+
+    def _alert_cooldown_ready(self, alert_key: str) -> bool:
+        last_sent = self.last_alert_at.get(alert_key, 0)
+        return time.time() - last_sent >= ALERT_COOLDOWN_SECONDS
+
+    def _mark_alert_sent(self, alert_key: str) -> None:
+        self.last_alert_at[alert_key] = time.time()
 
     def _signal_level(self, side: str, count: int) -> str:
         if count >= 3:
@@ -736,6 +1089,12 @@ class MonitorThread(threading.Thread):
     def _format_log_line(self, code: str, name: str, update_time: str, values: dict[str, float]) -> str:
         price_decimals = int(values.get("price_decimals", 4))
         parts = [code, name, f"price={self._fmt_price_like(values['price'], price_decimals)}", f"update={update_time}"]
+        for key in ["change_pct", "turnover", "volume_ratio", "intraday_pos", "dividend_yield", "atr_pct"]:
+            if key in values and not math.isnan(values[key]):
+                if key == "turnover":
+                    parts.append(f"{key}={values[key]:.0f}")
+                else:
+                    parts.append(f"{key}={values[key]:.2f}")
         for key in ["rsi", "kdj_k", "kdj_d", "kdj_j", "boll_lower", "boll_mid", "boll_upper"]:
             if key in values and not math.isnan(values[key]):
                 if key == "rsi":
@@ -747,6 +1106,11 @@ class MonitorThread(threading.Thread):
         for key in sorted(k for k in values if k.startswith("ma_") and not k.endswith("_prev")):
             if not math.isnan(values[key]):
                 parts.append(f"{key}={self._fmt_price_like(values[key], price_decimals)}")
+        for key in ["ma20_dev", "ma60_dev", "ma250_dev"]:
+            if key in values and not math.isnan(values[key]):
+                parts.append(f"{key}={values[key]:.2f}%")
+        if values.get("breakout"):
+            parts.append(f"breakout={values['breakout']}")
         return " ".join(parts)
 
 
@@ -989,11 +1353,18 @@ class StockWatchApp:
             "code": "代码",
             "name": "名称",
             "price": "现价",
+            "change_pct": "涨跌幅",
+            "turnover": "成交额",
+            "volume_ratio": "量比",
+            "intraday_pos": "日内位置",
             "dividend_yield": "股息率",
             "rsi": "RSI",
             "kdj": "KDJ",
             "boll": "BOLL",
             "ma": "MA",
+            "ma_dev": "均线偏离",
+            "atr_pct": "ATR",
+            "breakout": "突破",
             "update": "更新时间",
             "status": "状态",
         }
@@ -1001,11 +1372,18 @@ class StockWatchApp:
             "code": 100,
             "name": 150,
             "price": 80,
+            "change_pct": 78,
+            "turnover": 92,
+            "volume_ratio": 70,
+            "intraday_pos": 78,
             "dividend_yield": 80,
             "rsi": 90,
             "kdj": 150,
             "boll": 230,
             "ma": 260,
+            "ma_dev": 210,
+            "atr_pct": 70,
+            "breakout": 80,
             "update": 150,
             "status": 180,
         }
@@ -1321,7 +1699,14 @@ class StockWatchApp:
         price_decimals = int(values.get("price_decimals", 4))
         cell_signals = values.get("cell_signals", {}) or {}
         price = self._fmt(values.get("price"), price_decimals)
+        change_pct = self._fmt_signed_percent(values.get("change_pct"))
+        turnover = self._fmt_amount(values.get("turnover"))
+        volume_ratio = self._fmt(values.get("volume_ratio"), 2)
+        intraday_pos = self._fmt_percent(values.get("intraday_pos"), 0)
         dividend_yield = self._fmt_percent(values.get("dividend_yield"))
+        ma_dev = self._fmt_ma_devs(values)
+        atr_pct = self._fmt_percent(values.get("atr_pct"))
+        breakout = str(values.get("breakout", ""))
         rsi_text = self._with_cell_signal(self._fmt(values.get("rsi"), 2), cell_signals.get("rsi"))
         kdj_text = ""
         if "kdj_k" in values:
@@ -1340,7 +1725,25 @@ class StockWatchApp:
             ma_items.append(f"MA{period} {self._fmt(values.get(key), price_decimals)}")
         ma_text = self._with_cell_signal(" ".join(ma_items), cell_signals.get("ma"))
         row_tag = self._row_signal_tag(cell_signals)
-        row_values = (code, name, price, dividend_yield, rsi_text, kdj_text, boll_text, ma_text, update_time, status)
+        row_values = (
+            code,
+            name,
+            price,
+            change_pct,
+            turnover,
+            volume_ratio,
+            intraday_pos,
+            dividend_yield,
+            rsi_text,
+            kdj_text,
+            boll_text,
+            ma_text,
+            ma_dev,
+            atr_pct,
+            breakout,
+            update_time,
+            status,
+        )
         if code in self.quote_rows:
             self.quote_tree.item(self.quote_rows[code], values=row_values, tags=(row_tag,) if row_tag else ())
         else:
@@ -1373,7 +1776,7 @@ class StockWatchApp:
             self.quote_sort_reverse = not self.quote_sort_reverse
         else:
             self.quote_sort_column = column
-            self.quote_sort_reverse = True if column in {"price", "dividend_yield", "rsi", "kdj", "boll", "ma"} else False
+            self.quote_sort_reverse = True if column in self._numeric_quote_columns() else False
         self._update_quote_heading_arrows()
         self._apply_quote_sort()
 
@@ -1397,17 +1800,39 @@ class StockWatchApp:
 
     def _quote_sort_key(self, row_id: str, column: str):
         value = self.quote_tree.set(row_id, column)
-        if column in {"price", "dividend_yield", "rsi", "kdj", "boll", "ma"}:
+        if column in self._numeric_quote_columns():
             parsed = self._first_float(value)
             if parsed is None:
                 return float("-inf") if self.quote_sort_reverse else float("inf")
             return parsed
         return value
 
+    def _numeric_quote_columns(self) -> set[str]:
+        return {
+            "price",
+            "change_pct",
+            "turnover",
+            "volume_ratio",
+            "intraday_pos",
+            "dividend_yield",
+            "rsi",
+            "kdj",
+            "boll",
+            "ma",
+            "ma_dev",
+            "atr_pct",
+        }
+
     def _first_float(self, text: str) -> float | None:
         for token in text.replace(",", " ").split():
+            multiplier = 1.0
+            if token.endswith("亿"):
+                multiplier = 100000000.0
+            elif token.endswith("万"):
+                multiplier = 10000.0
+            token = token.strip("%亿万")
             try:
-                return float(token)
+                return float(token) * multiplier
             except ValueError:
                 continue
         return None
@@ -1457,6 +1882,41 @@ class StockWatchApp:
     def _fmt_percent(self, value, decimals: int = 2) -> str:
         text = self._fmt(value, decimals)
         return f"{text}%" if text else ""
+
+    def _fmt_signed_percent(self, value, decimals: int = 2) -> str:
+        text = self._fmt(value, decimals)
+        if not text:
+            return ""
+        try:
+            numeric = float(value)
+            return f"{numeric:+.{decimals}f}%"
+        except Exception:
+            return f"{text}%"
+
+    def _fmt_amount(self, value) -> str:
+        if value is None:
+            return ""
+        try:
+            amount = float(value)
+            if math.isnan(amount):
+                return ""
+            abs_amount = abs(amount)
+            if abs_amount >= 100000000:
+                return f"{amount / 100000000:.2f}亿"
+            if abs_amount >= 10000:
+                return f"{amount / 10000:.2f}万"
+            return f"{amount:.0f}"
+        except Exception:
+            return str(value)
+
+    def _fmt_ma_devs(self, values: dict) -> str:
+        parts = []
+        for period in (20, 60, 250):
+            key = f"ma{period}_dev"
+            text = self._fmt_signed_percent(values.get(key), 1)
+            if text:
+                parts.append(f"{period}:{text}")
+        return " ".join(parts)
 
     def _append_log(self, message: str) -> None:
         self.log_text.insert("end", f"{datetime.now():%H:%M:%S} {message}\n")
@@ -1508,3 +1968,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
