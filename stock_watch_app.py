@@ -3,11 +3,13 @@ import ctypes
 import html
 import json
 import math
+import os
 import queue
 import re
 import threading
 import time
 import tkinter as tk
+import urllib.parse
 import urllib.request
 from collections import deque
 from dataclasses import asdict, dataclass, field
@@ -35,6 +37,9 @@ DIVIDEND_RATE_WINDOW_SECONDS = 30.0
 CAPITAL_FLOW_RATE_LIMIT = 25
 CAPITAL_FLOW_RATE_WINDOW_SECONDS = 30.0
 CAPITAL_FLOW_CACHE_TTL_SECONDS = 60.0
+ETF_SHARE_RATE_LIMIT = 10
+ETF_SHARE_RATE_WINDOW_SECONDS = 30.0
+ETF_SHARE_CACHE_TTL_SECONDS = 6 * 60 * 60.0
 QUOTE_COLUMNS = (
     "code",
     "name",
@@ -262,6 +267,121 @@ def fetch_eastmoney_fund_dividends(code: str) -> list[dict]:
             }
         )
     return rows
+
+
+def parse_jsonp_payload(text: str) -> dict:
+    start = text.find("(")
+    end = text.rfind(")")
+    if start == -1 or end == -1 or end <= start:
+        return json.loads(text)
+    return json.loads(text[start + 1 : end])
+
+
+def fetch_sse_etf_total_units(code: str) -> float | None:
+    normalized = normalize_code(code)
+    if not normalized.startswith("SH."):
+        return None
+    fund_code = normalized.split(".", 1)[-1]
+    if not (len(fund_code) == 6 and fund_code.isdigit()):
+        return None
+    params = {
+        "jsonCallBack": "jsonpCallback",
+        "isPagination": "true",
+        "pageHelp.pageSize": "1000",
+        "pageHelp.pageNo": "1",
+        "pageHelp.beginPage": "1",
+        "pageHelp.cacheSize": "1",
+        "pageHelp.endPage": "1",
+        "sqlId": "COMMON_SSE_ZQPZ_ETFZL_XXPL_ETFGM_SEARCH_L",
+        "STAT_DATE": "",
+    }
+    url = "https://query.sse.com.cn/commonQuery.do?" + urllib.parse.urlencode(params)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Referer": "https://www.sse.com.cn/market/funddata/volumn/etfvolumn/",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        text = response.read().decode("utf-8", errors="ignore")
+    payload = parse_jsonp_payload(text)
+    rows = payload.get("pageHelp", {}).get("data", [])
+    for row in rows:
+        if str(row.get("SEC_CODE", "")).strip() != fund_code:
+            continue
+        total_10k_units = safe_parse_number(row.get("TOT_VOL"))
+        if total_10k_units and total_10k_units > 0:
+            return total_10k_units * 10000
+    return None
+
+
+def futu_code_to_tushare(code: str) -> str | None:
+    normalized = normalize_code(code)
+    if "." not in normalized:
+        return None
+    market, fund_code = normalized.split(".", 1)
+    if market not in {"SH", "SZ"} or not (len(fund_code) == 6 and fund_code.isdigit()):
+        return None
+    suffix = "SH" if market == "SH" else "SZ"
+    return f"{fund_code}.{suffix}"
+
+
+def fetch_tushare_etf_total_units(code: str) -> float | None:
+    token = os.environ.get("TUSHARE_TOKEN", "").strip()
+    if not token:
+        return None
+    ts_code = futu_code_to_tushare(code)
+    if not ts_code:
+        return None
+    body = json.dumps(
+        {
+            "api_name": "etf_share_size",
+            "token": token,
+            "params": {"ts_code": ts_code},
+            "fields": "trade_date,ts_code,total_share,exchange",
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        "https://api.tushare.pro",
+        data=body,
+        headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    if payload.get("code") not in (0, "0", None):
+        raise RuntimeError(payload.get("msg") or payload)
+    data = payload.get("data") or {}
+    fields = list(data.get("fields") or [])
+    items = list(data.get("items") or [])
+    if not fields or not items or "total_share" not in fields:
+        return None
+    if "trade_date" in fields:
+        date_index = fields.index("trade_date")
+        items.sort(key=lambda item: str(item[date_index] if len(item) > date_index else ""), reverse=True)
+    index = fields.index("total_share")
+    total_10k_units = safe_parse_number(items[0][index] if len(items[0]) > index else None)
+    if total_10k_units and total_10k_units > 0:
+        return total_10k_units * 10000
+    return None
+
+
+def safe_parse_number(value) -> float | None:
+    try:
+        text = str(value).replace(",", "").strip()
+        if not text or text == "-":
+            return None
+        numeric = float(text)
+        if math.isnan(numeric):
+            return None
+        return numeric
+    except Exception:
+        return None
+
+
+def fetch_external_etf_total_units(code: str) -> float | None:
+    return fetch_sse_etf_total_units(code) or fetch_tushare_etf_total_units(code)
 
 
 def parse_periods(text: str) -> list[int]:
@@ -587,6 +707,12 @@ class MonitorThread(threading.Thread):
         self.capital_flow_lock = threading.Lock()
         self.capital_flow_limiter = RollingRateLimiter(CAPITAL_FLOW_RATE_LIMIT, CAPITAL_FLOW_RATE_WINDOW_SECONDS)
         self.capital_flow_worker: threading.Thread | None = None
+        self.etf_share_cache: dict[str, tuple[float, float]] = {}
+        self.etf_share_pending: set[str] = set()
+        self.etf_share_queue: deque[str] = deque()
+        self.etf_share_lock = threading.Lock()
+        self.etf_share_limiter = RollingRateLimiter(ETF_SHARE_RATE_LIMIT, ETF_SHARE_RATE_WINDOW_SECONDS)
+        self.etf_share_worker: threading.Thread | None = None
         self.cache = MarketDataCache()
         self.snapshot_limiter = RollingRateLimiter(SNAPSHOT_RATE_LIMIT, SNAPSHOT_RATE_WINDOW_SECONDS)
         self.last_emit_at: dict[str, float] = {}
@@ -606,6 +732,7 @@ class MonitorThread(threading.Thread):
             ctx.set_handler(CachedQuoteHandler(self.cache))
             self._ensure_dividend_worker()
             self._ensure_capital_flow_worker()
+            self._ensure_etf_share_worker()
             self.app_queue.put(("status", "已连接 Futu OpenD"))
             while not self.stop_event.is_set():
                 with self.config_lock:
@@ -743,8 +870,13 @@ class MonitorThread(threading.Thread):
             if turnover is not None:
                 values["turnover"] = turnover
             turnover_rate = self._safe_float(row.get("turnover_rate"))
-            if turnover_rate is not None:
+            if turnover_rate is not None and turnover_rate > 0:
                 values["turnover_rate"] = turnover_rate
+            else:
+                calculated_turnover_rate = self._calculated_turnover_rate(code, row)
+                if calculated_turnover_rate is not None:
+                    values["turnover_rate"] = calculated_turnover_rate
+                    values["turnover_rate_calc"] = 1.0
             volume_ratio = self._safe_float(row.get("volume_ratio"))
             if volume_ratio is not None:
                 values["volume_ratio"] = volume_ratio
@@ -821,6 +953,43 @@ class MonitorThread(threading.Thread):
     def _chunks(self, values: list[str], size: int):
         for index in range(0, len(values), size):
             yield values[index : index + size]
+
+    def _calculated_turnover_rate(self, code: str, row) -> float | None:
+        volume = self._safe_positive_float(row.get("volume"))
+        if volume is None:
+            return None
+        total_units = self._etf_total_units(code, row)
+        if total_units is None:
+            return None
+        return volume / total_units * 100
+
+    def _etf_total_units(self, code: str, row) -> float | None:
+        snapshot_units = self._snapshot_total_units(row)
+        if snapshot_units is not None:
+            self.etf_share_cache[code] = (time.time(), snapshot_units)
+            return snapshot_units
+        cached = self.etf_share_cache.get(code)
+        now = time.time()
+        if cached and now - cached[0] < ETF_SHARE_CACHE_TTL_SECONDS:
+            return cached[1] or None
+        with self.etf_share_lock:
+            if code not in self.etf_share_pending:
+                self.etf_share_pending.add(code)
+                self.etf_share_queue.append(code)
+        return cached[1] if cached and cached[1] else None
+
+    def _snapshot_total_units(self, row) -> float | None:
+        for key in (
+            "trust_outstanding_units",
+            "outstanding_shares",
+            "issued_shares",
+            "total_shares",
+            "circulating_shares",
+        ):
+            value = self._safe_positive_float(row.get(key))
+            if value is not None:
+                return value
+        return None
 
     def _snapshot_dividend_yield(self, row, price: float) -> float | None:
         for key in ("dividend_ratio_ttm", "dividend_lfy_ratio", "trust_dividend_yield"):
@@ -963,6 +1132,38 @@ class MonitorThread(threading.Thread):
         finally:
             with self.capital_flow_lock:
                 self.capital_flow_pending.discard(code)
+
+    def _ensure_etf_share_worker(self) -> None:
+        if self.etf_share_worker and self.etf_share_worker.is_alive():
+            return
+        self.etf_share_worker = threading.Thread(target=self._etf_share_worker_loop, daemon=True)
+        self.etf_share_worker.start()
+
+    def _etf_share_worker_loop(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                code = None
+                with self.etf_share_lock:
+                    if self.etf_share_queue:
+                        code = self.etf_share_queue.popleft()
+                if not code:
+                    self.stop_event.wait(1)
+                    continue
+                if self.etf_share_limiter.wait(self.stop_event):
+                    self._refresh_etf_share_cache(code)
+        except Exception as exc:
+            write_log(f"ERROR ETF share worker {exc}")
+
+    def _refresh_etf_share_cache(self, code: str) -> None:
+        try:
+            total_units = fetch_external_etf_total_units(code)
+            self.etf_share_cache[code] = (time.time(), total_units or 0.0)
+        except Exception as exc:
+            self.etf_share_cache[code] = (time.time(), 0.0)
+            write_log(f"ERROR ETF share {code} {exc}")
+        finally:
+            with self.etf_share_lock:
+                self.etf_share_pending.discard(code)
 
     def _latest_capital_inflow(self, data) -> float:
         if data is None or not hasattr(data, "empty") or data.empty or "in_flow" not in data.columns:
