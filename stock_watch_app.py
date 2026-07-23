@@ -32,20 +32,29 @@ KLINE_CACHE_TTL_SECONDS = 5 * 60.0
 KLINE_REFRESH_PER_TICK = 3
 DIVIDEND_RATE_LIMIT = 20
 DIVIDEND_RATE_WINDOW_SECONDS = 30.0
+CAPITAL_FLOW_RATE_LIMIT = 25
+CAPITAL_FLOW_RATE_WINDOW_SECONDS = 30.0
+CAPITAL_FLOW_CACHE_TTL_SECONDS = 60.0
 QUOTE_COLUMNS = (
     "code",
     "name",
     "price",
     "change_pct",
     "turnover",
+    "turnover_rate",
     "volume_ratio",
     "intraday_pos",
+    "premium_rate",
+    "vwap_dev",
+    "capital_flow",
+    "bid_ask_ratio",
     "dividend_yield",
     "rsi",
     "kdj",
     "boll",
     "ma",
     "ma_dev",
+    "yhigh_drawdown",
     "atr_pct",
     "breakout",
     "update",
@@ -57,12 +66,18 @@ DEFAULT_DISPLAY_COLUMNS = [
     "price",
     "change_pct",
     "turnover",
+    "turnover_rate",
     "volume_ratio",
     "intraday_pos",
+    "premium_rate",
+    "vwap_dev",
+    "capital_flow",
+    "bid_ask_ratio",
     "dividend_yield",
     "rsi",
     "boll",
     "ma_dev",
+    "yhigh_drawdown",
     "atr_pct",
     "breakout",
     "status",
@@ -566,6 +581,12 @@ class MonitorThread(threading.Thread):
         self.dividend_lock = threading.Lock()
         self.dividend_limiter = RollingRateLimiter(DIVIDEND_RATE_LIMIT, DIVIDEND_RATE_WINDOW_SECONDS)
         self.dividend_worker: threading.Thread | None = None
+        self.capital_flow_cache: dict[str, tuple[float, float]] = {}
+        self.capital_flow_pending: set[str] = set()
+        self.capital_flow_queue: deque[str] = deque()
+        self.capital_flow_lock = threading.Lock()
+        self.capital_flow_limiter = RollingRateLimiter(CAPITAL_FLOW_RATE_LIMIT, CAPITAL_FLOW_RATE_WINDOW_SECONDS)
+        self.capital_flow_worker: threading.Thread | None = None
         self.cache = MarketDataCache()
         self.snapshot_limiter = RollingRateLimiter(SNAPSHOT_RATE_LIMIT, SNAPSHOT_RATE_WINDOW_SECONDS)
         self.last_emit_at: dict[str, float] = {}
@@ -584,6 +605,7 @@ class MonitorThread(threading.Thread):
             ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
             ctx.set_handler(CachedQuoteHandler(self.cache))
             self._ensure_dividend_worker()
+            self._ensure_capital_flow_worker()
             self.app_queue.put(("status", "已连接 Futu OpenD"))
             while not self.stop_event.is_set():
                 with self.config_lock:
@@ -730,6 +752,18 @@ class MonitorThread(threading.Thread):
             low_price = self._safe_float(row.get("low_price"))
             if high_price is not None and low_price is not None and high_price > low_price:
                 values["intraday_pos"] = (price - low_price) / (high_price - low_price) * 100
+            premium_rate = self._snapshot_premium_rate(row, price)
+            if premium_rate is not None:
+                values["premium_rate"] = premium_rate
+            avg_price = self._safe_float(row.get("avg_price"))
+            if avg_price is not None and avg_price > 0:
+                values["vwap_dev"] = (price - avg_price) / avg_price * 100
+            bid_ask_ratio = self._safe_float(row.get("bid_ask_ratio"))
+            if bid_ask_ratio is not None:
+                values["bid_ask_ratio"] = bid_ask_ratio
+            capital_flow = self._capital_net_inflow(code)
+            if capital_flow is not None:
+                values["capital_flow"] = capital_flow
             if settings.rsi_enabled:
                 values["rsi"] = rsi_cn(closes, settings.rsi_period)
             if settings.kdj_enabled:
@@ -757,6 +791,11 @@ class MonitorThread(threading.Thread):
                 ma_value = moving_average(closes, period)
                 if not math.isnan(ma_value) and ma_value != 0:
                     values[f"ma{period}_dev"] = (price - ma_value) / ma_value * 100
+            if len(highs) >= 250:
+                year_high = max(highs[-250:])
+                if year_high > 0:
+                    values["year_high"] = year_high
+                    values["yhigh_drawdown"] = (year_high - price) / year_high * 100
             atr_value = atr_percent(highs, lows, closes, 14)
             if not math.isnan(atr_value):
                 values["atr_pct"] = atr_value
@@ -791,6 +830,15 @@ class MonitorThread(threading.Thread):
         dividend_amount = self._safe_positive_float(row.get("dividend_ttm")) or self._safe_positive_float(row.get("dividend_lfy"))
         if dividend_amount is not None and price > 0:
             return dividend_amount / price * 100
+        return None
+
+    def _snapshot_premium_rate(self, row, price: float) -> float | None:
+        premium = self._safe_float(row.get("trust_premium"))
+        if premium is not None:
+            return premium
+        nav = self._safe_positive_float(row.get("trust_netAssetValue"))
+        if nav is not None and price > 0:
+            return (price - nav) / nav * 100
         return None
 
     def _safe_positive_float(self, value) -> float | None:
@@ -864,6 +912,63 @@ class MonitorThread(threading.Thread):
         finally:
             with self.dividend_lock:
                 self.dividend_pending.discard(code)
+
+    def _capital_net_inflow(self, code: str) -> float | None:
+        cached = self.capital_flow_cache.get(code)
+        now = time.time()
+        if cached and now - cached[0] < CAPITAL_FLOW_CACHE_TTL_SECONDS:
+            return cached[1]
+        with self.capital_flow_lock:
+            if code not in self.capital_flow_pending:
+                self.capital_flow_pending.add(code)
+                self.capital_flow_queue.append(code)
+        return cached[1] if cached else None
+
+    def _ensure_capital_flow_worker(self) -> None:
+        if self.capital_flow_worker and self.capital_flow_worker.is_alive():
+            return
+        self.capital_flow_worker = threading.Thread(target=self._capital_flow_worker_loop, daemon=True)
+        self.capital_flow_worker.start()
+
+    def _capital_flow_worker_loop(self) -> None:
+        ctx = None
+        try:
+            ctx = OpenQuoteContext(host="127.0.0.1", port=11111)
+            while not self.stop_event.is_set():
+                code = None
+                with self.capital_flow_lock:
+                    if self.capital_flow_queue:
+                        code = self.capital_flow_queue.popleft()
+                if not code:
+                    self.stop_event.wait(1)
+                    continue
+                if self.capital_flow_limiter.wait(self.stop_event):
+                    self._refresh_capital_flow_cache(ctx, code)
+        except Exception as exc:
+            write_log(f"ERROR capital flow worker {exc}")
+        finally:
+            if ctx:
+                ctx.close()
+
+    def _refresh_capital_flow_cache(self, ctx: OpenQuoteContext, code: str) -> None:
+        try:
+            ret, data = ctx.get_capital_flow(code)
+            if ret != RET_OK:
+                raise RuntimeError(str(data))
+            value = self._latest_capital_inflow(data)
+            self.capital_flow_cache[code] = (time.time(), value)
+        except Exception as exc:
+            self.capital_flow_cache[code] = (time.time(), 0.0)
+            write_log(f"ERROR capital flow {code} {exc}")
+        finally:
+            with self.capital_flow_lock:
+                self.capital_flow_pending.discard(code)
+
+    def _latest_capital_inflow(self, data) -> float:
+        if data is None or not hasattr(data, "empty") or data.empty or "in_flow" not in data.columns:
+            return 0.0
+        value = self._safe_float(data.iloc[-1].get("in_flow"))
+        return value if value is not None else 0.0
 
     def _sum_recent_dividends(self, dividend_list: list[dict]) -> float | None:
         cutoff = datetime.now() - timedelta(days=365)
@@ -1089,9 +1194,21 @@ class MonitorThread(threading.Thread):
     def _format_log_line(self, code: str, name: str, update_time: str, values: dict[str, float]) -> str:
         price_decimals = int(values.get("price_decimals", 4))
         parts = [code, name, f"price={self._fmt_price_like(values['price'], price_decimals)}", f"update={update_time}"]
-        for key in ["change_pct", "turnover", "volume_ratio", "intraday_pos", "dividend_yield", "atr_pct"]:
+        for key in [
+            "change_pct",
+            "turnover",
+            "turnover_rate",
+            "volume_ratio",
+            "intraday_pos",
+            "premium_rate",
+            "vwap_dev",
+            "capital_flow",
+            "bid_ask_ratio",
+            "dividend_yield",
+            "atr_pct",
+        ]:
             if key in values and not math.isnan(values[key]):
-                if key == "turnover":
+                if key in {"turnover", "capital_flow"}:
                     parts.append(f"{key}={values[key]:.0f}")
                 else:
                     parts.append(f"{key}={values[key]:.2f}")
@@ -1109,6 +1226,8 @@ class MonitorThread(threading.Thread):
         for key in ["ma20_dev", "ma60_dev", "ma250_dev"]:
             if key in values and not math.isnan(values[key]):
                 parts.append(f"{key}={values[key]:.2f}%")
+        if "yhigh_drawdown" in values and not math.isnan(values["yhigh_drawdown"]):
+            parts.append(f"yhigh_drawdown={values['yhigh_drawdown']:.2f}%")
         if values.get("breakout"):
             parts.append(f"breakout={values['breakout']}")
         return " ".join(parts)
@@ -1355,14 +1474,20 @@ class StockWatchApp:
             "price": "现价",
             "change_pct": "涨跌幅",
             "turnover": "成交额",
+            "turnover_rate": "换手率",
             "volume_ratio": "量比",
             "intraday_pos": "日内位置",
+            "premium_rate": "折溢价",
+            "vwap_dev": "VWAP偏离",
+            "capital_flow": "净流入",
+            "bid_ask_ratio": "委比",
             "dividend_yield": "股息率",
             "rsi": "RSI",
             "kdj": "KDJ",
             "boll": "BOLL",
             "ma": "MA",
             "ma_dev": "均线偏离",
+            "yhigh_drawdown": "年高回撤",
             "atr_pct": "ATR",
             "breakout": "突破",
             "update": "更新时间",
@@ -1374,14 +1499,20 @@ class StockWatchApp:
             "price": 80,
             "change_pct": 78,
             "turnover": 92,
+            "turnover_rate": 78,
             "volume_ratio": 70,
             "intraday_pos": 78,
+            "premium_rate": 78,
+            "vwap_dev": 82,
+            "capital_flow": 92,
+            "bid_ask_ratio": 70,
             "dividend_yield": 80,
             "rsi": 90,
             "kdj": 150,
             "boll": 230,
             "ma": 260,
             "ma_dev": 210,
+            "yhigh_drawdown": 82,
             "atr_pct": 70,
             "breakout": 80,
             "update": 150,
@@ -1701,10 +1832,16 @@ class StockWatchApp:
         price = self._fmt(values.get("price"), price_decimals)
         change_pct = self._fmt_signed_percent(values.get("change_pct"))
         turnover = self._fmt_amount(values.get("turnover"))
+        turnover_rate = self._fmt_percent(values.get("turnover_rate"))
         volume_ratio = self._fmt(values.get("volume_ratio"), 2)
         intraday_pos = self._fmt_percent(values.get("intraday_pos"), 0)
+        premium_rate = self._fmt_signed_percent(values.get("premium_rate"))
+        vwap_dev = self._fmt_signed_percent(values.get("vwap_dev"))
+        capital_flow = self._fmt_signed_amount(values.get("capital_flow"))
+        bid_ask_ratio = self._fmt_signed_percent(values.get("bid_ask_ratio"))
         dividend_yield = self._fmt_percent(values.get("dividend_yield"))
         ma_dev = self._fmt_ma_devs(values)
+        yhigh_drawdown = self._fmt_percent(values.get("yhigh_drawdown"))
         atr_pct = self._fmt_percent(values.get("atr_pct"))
         breakout = str(values.get("breakout", ""))
         rsi_text = self._with_cell_signal(self._fmt(values.get("rsi"), 2), cell_signals.get("rsi"))
@@ -1731,14 +1868,20 @@ class StockWatchApp:
             price,
             change_pct,
             turnover,
+            turnover_rate,
             volume_ratio,
             intraday_pos,
+            premium_rate,
+            vwap_dev,
+            capital_flow,
+            bid_ask_ratio,
             dividend_yield,
             rsi_text,
             kdj_text,
             boll_text,
             ma_text,
             ma_dev,
+            yhigh_drawdown,
             atr_pct,
             breakout,
             update_time,
@@ -1812,14 +1955,20 @@ class StockWatchApp:
             "price",
             "change_pct",
             "turnover",
+            "turnover_rate",
             "volume_ratio",
             "intraday_pos",
+            "premium_rate",
+            "vwap_dev",
+            "capital_flow",
+            "bid_ask_ratio",
             "dividend_yield",
             "rsi",
             "kdj",
             "boll",
             "ma",
             "ma_dev",
+            "yhigh_drawdown",
             "atr_pct",
         }
 
@@ -1908,6 +2057,18 @@ class StockWatchApp:
             return f"{amount:.0f}"
         except Exception:
             return str(value)
+
+    def _fmt_signed_amount(self, value) -> str:
+        text = self._fmt_amount(value)
+        if not text:
+            return ""
+        try:
+            amount = float(value)
+            if amount > 0:
+                return "+" + text
+        except Exception:
+            pass
+        return text
 
     def _fmt_ma_devs(self, values: dict) -> str:
         parts = []
